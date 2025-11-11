@@ -75,6 +75,8 @@ class Page {
         var fileURL: URL?
         var success = false
         var transform = renderer.getDrawingTransform(.mediaBox, rect: CGRect(origin: CGPoint.zero, size: bitmapSize), rotate: 0, preserveAspectRatio: true)
+        var outputWidth = width
+        var outputHeight = height
         let compressionQuality = CGFloat(quality) / 100
         tempData.withUnsafeMutableBytes { (ptr) in
             let rawPtr = ptr.baseAddress
@@ -114,13 +116,23 @@ class Page {
                 #endif
 
                 if (crop != nil) {
-                    // Perform cropping in Core Graphics
-                    let cutImageRef: CGImage = (image.cgImage?.cropping(to:crop!))!
-                    #if os(iOS)
-                    image = UIImage(cgImage: cutImageRef)
-                    #elseif os(macOS)
-                    image = NSBitmapImageRep(cgImage: cutImageRef)
-                    #endif
+                    if let cgImage = image.cgImage,
+                       let safeCrop = sanitizeCropRect(crop!, bitmapSize: bitmapSize),
+                       let cutImageRef = cgImage.cropping(to: safeCrop) {
+                        #if os(iOS)
+                        image = UIImage(cgImage: cutImageRef, scale: image.scale, orientation: image.imageOrientation)
+                        #elseif os(macOS)
+                        image = NSBitmapImageRep(cgImage: cutImageRef)
+                        #endif
+                        outputWidth = Int(safeCrop.width)
+                        outputHeight = Int(safeCrop.height)
+                    } else {
+                        #if os(iOS)
+                        NSLog("pdfx render: skip invalid crop rect \(String(describing: crop)) for bitmap size \(bitmapSize)")
+                        #else
+                        print("pdfx render: skip invalid crop rect \(String(describing: crop)) for bitmap size \(bitmapSize)")
+                        #endif
+                    }
                 }
 
                 switch(compressFormat) {
@@ -148,12 +160,40 @@ class Page {
             }
         }
         return success ? Page.DataResult(
-            width: (crop != nil) ? Int(crop!.width) : width,
-            height: (crop != nil) ? Int(crop!.height) : height,
+            width: outputWidth,
+            height: outputHeight,
             path: (fileURL != nil) ? fileURL!.path : ""
         ) : nil
     }
 
+    private func sanitizeCropRect(_ crop: CGRect, bitmapSize: CGSize) -> CGRect? {
+        if bitmapSize.width <= 0 || bitmapSize.height <= 0 {
+            return nil
+        }
+        let bounds = CGRect(origin: .zero, size: bitmapSize)
+        let normalized = crop.standardized
+        let intersection = normalized.intersection(bounds)
+        if intersection.isNull || intersection.width <= 0 || intersection.height <= 0 {
+            return nil
+        }
+        var adjusted = intersection.integral
+        if adjusted.origin.x < bounds.minX {
+            adjusted.origin.x = bounds.minX
+        }
+        if adjusted.origin.y < bounds.minY {
+            adjusted.origin.y = bounds.minY
+        }
+        if adjusted.maxX > bounds.maxX {
+            adjusted.size.width = bounds.maxX - adjusted.origin.x
+        }
+        if adjusted.maxY > bounds.maxY {
+            adjusted.size.height = bounds.maxY - adjusted.origin.y
+        }
+        if adjusted.width <= 0 || adjusted.height <= 0 {
+            return nil
+        }
+        return adjusted
+    }
     func writeToTempFile(data: Data, compressFormat: CompressFormat) -> URL? {
         // Create missing directories
         let docURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
